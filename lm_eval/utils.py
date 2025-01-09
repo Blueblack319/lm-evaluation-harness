@@ -504,3 +504,14 @@ def weighted_f1_score(items):
     preds = unzipped_list[1]
     fscore = f1_score(golds, preds, average="weighted")
     return fscore
+
+
+def str_to_dict(arg_string):
+    # Split the string into key-value pairs
+    items = arg_string.split(",")
+    # Split each item into key and value, and store in a dictionary
+    result_dict = {}
+    for item in items:
+        key, value = item.split("=")
+        result_dict[key.strip()] = value.strip()
+    return result_dict

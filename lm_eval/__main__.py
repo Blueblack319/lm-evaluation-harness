@@ -10,7 +10,12 @@ from lm_eval import evaluator, utils
 from lm_eval.evaluator import request_caching_arg_to_dict
 from lm_eval.loggers import EvaluationTracker, WandbLogger
 from lm_eval.tasks import TaskManager
-from lm_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
+from lm_eval.utils import (
+    handle_non_serializable,
+    make_table,
+    simple_parse_args_string,
+    str_to_dict,
+)
 
 
 def _int_or_none_list_arg_type(
@@ -257,6 +262,14 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
+
+    # [x] Tiered KVCache
+    parser.add_argument(
+        "--cache_args",
+        type=str,
+        default=None,
+        help="comma-seperated list of arguments for tiered KVCache",
+    )
     return parser
 
 
@@ -379,9 +392,32 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         cache_requests=args.cache_requests
     )
 
+    # [x] Process Tiered KVCache Arguments
+    if isinstance(args.model_args, str):
+        model_args = str_to_dict(args.model_args)
+    if args.cache_args != None:
+        cache_args = str_to_dict(args.cache_args)
+        assert "algo" in cache_args
+        assert "cache_rule" in cache_args
+
+        if cache_args["algo"] in {"ideal"}:
+            assert "cache_ratio" in cache_args
+        if cache_args["algo"] in {"thresholding"}:
+            assert "threshold" in cache_args
+
+        if "threshold" in cache_args:
+            cache_args["threshold"] = float(cache_args["threshold"])
+        if "cache_ratio" in cache_args:
+            cache_args["cache_ratio"] = float(cache_args["cache_ratio"])
+
+    for key in cache_args:
+        model_args[key] = cache_args[key]
+
+    print(model_args)
+
     results = evaluator.simple_evaluate(
         model=args.model,
-        model_args=args.model_args,
+        model_args=model_args,
         tasks=task_names,
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
