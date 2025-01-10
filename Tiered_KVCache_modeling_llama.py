@@ -334,14 +334,21 @@ class LlamaAttentionTieredKVCache(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        # For cache config
-        self.threshold = config.threshold
+        # NOTE: cache config
+        self.algo = config.algo
+        self.alpha = config.alpha
         self.cache_ratio = config.cache_ratio
         self.cache_rule = config.cache_rule
+        self.decay_rate = config.decay_rate
+        self.count = 0
+
+        self.cache_indices = None  # (batch_size, kv_head_num, 1, seq_len)
+        self.acc_scores = None  # (batch_size, q_head_num, 1, seq_len)
 
         if self.layer_idx == 0:
             print("Layer " + str(self.layer_idx))
-            print("threshold: ", self.threshold)
+            print("algo: ", self.algo)
+            print("threshold: ", self.alpha)
             print("cache_ratio: ", self.cache_ratio)
             print("cache_rule: ", self.cache_rule)
             print(" ")
@@ -382,6 +389,9 @@ class LlamaAttentionTieredKVCache(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+
+        # Identify Prefill phase
+        is_prefill = len(past_key_value.key_cache) <= self.layer_idx
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (
@@ -455,15 +465,271 @@ class LlamaAttentionTieredKVCache(nn.Module):
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attn_weights = (
+                attn_weights + causal_mask
+            )  # (Batch_size, q_head_num, 1, seq_len)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+        if not is_prefill:
+            attn_weights_reshaped = attn_weights.clone()
+            attn_weights_reshaped = attn_weights_reshaped.view(
+                bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+            )
+
+            if self.cache_rule == "max":
+                # (batch_size, kv_head_num, 1, seq_len)
+                attn_weights_reshaped = torch.max(attn_weights_reshaped, dim=2).values
+            if self.cache_rule == "mean":
+                attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+            _, _, _, seq_len = attn_weights_reshaped.shape
+            cache_size = int(self.cache_ratio * self.num_key_value_heads * seq_len)
+            mask = torch.zeros(
+                (bsz, self.num_key_value_heads * seq_len), dtype=torch.bool
+            ).cuda()
+
+            # [x] Create and apply mask for dynamic sparse attention
+            if (
+                self.algo == "thresholding_upper"
+            ):  # Select important tokens via threshold
+                # Determine GQA-aware current_cache_threshold
+                if self.cache_rule in ["max", "mean"]:
+                    current_cache_threshold = (
+                        torch.max(attn_weights_reshaped, dim=-1, keepdim=True).values
+                        - self.alpha
+                    )
+                selected_indices = attn_weights_reshaped > current_cache_threshold
+                attn_weights_reshaped = torch.where(
+                    selected_indices,
+                    attn_weights_reshaped,
+                    torch.zeros_like(attn_weights_reshaped),
+                )
+                attn_weights_reshaped = attn_weights_reshaped.view(bsz, -1)
+
+                top_indices = torch.topk(
+                    attn_weights_reshaped, cache_size, dim=-1
+                ).indices
+                mask.scatter_(dim=-1, index=top_indices, value=True)
+                mask = mask.view(bsz, self.num_key_value_heads, 1, seq_len)
+                mask = repeat_kv(mask, self.num_key_value_groups)
+                ###
+            elif self.algo == "ideal_1_upper":  # Select topk per head
+                _, topk_indices = torch.topk(
+                    attn_weights_reshaped, int(seq_len * self.cache_ratio), dim=-1
+                )
+                topk_indices = repeat_kv(topk_indices, self.num_key_value_groups)
+                mask = torch.zeros_like(attn_weights, dtype=torch.bool).scatter_(
+                    dim=-1, index=topk_indices, value=True
+                )
+
+            elif self.algo == "ideal_2_upper":  # Select topk from all heads
+                attn_weights_reshaped = attn_weights_reshaped.view(bsz, -1)
+                assert (
+                    attn_weights_reshaped.shape[-1] == mask.shape[-1]
+                ), "Mask has the incorrect shape"
+
+                top_indices = torch.topk(
+                    attn_weights_reshaped, cache_size, dim=-1
+                ).indices
+                mask.scatter_(dim=-1, index=top_indices, value=True)
+                mask = mask.view(bsz, self.num_key_value_heads, 1, seq_len)
+                mask = repeat_kv(mask, self.num_key_value_groups)
+
+            elif self.algo == "thresholding":
+                # [x] Create mask by cache_indices (batch_size, kv_head_num, 1, seq_len - 1)
+                current_kv = torch.ones(
+                    (*self.cache_indices.shape[:-1], 1), dtype=torch.bool
+                ).cuda()
+                mask = torch.cat((self.cache_indices, current_kv), dim=-1)
+                mask = repeat_kv(mask, self.num_key_value_groups)
+
+                # [x] Compute current_cache_threshold
+                # Determine GQA-aware current_cache_threshold
+                if self.cache_rule in ["max", "mean"]:
+                    current_cache_threshold = (
+                        torch.max(attn_weights_reshaped, dim=-1, keepdim=True).values
+                        - self.alpha
+                    )  # (batch_size, kv_head_num, 1, seq_len)
+                # selected_indices = attn_weights_reshaped > current_cache_threshold
+                # attn_weights_reshaped = torch.where(
+                #     selected_indices,
+                #     self.acc_scores,
+                #     torch.zeros_like(self.acc_scores),
+                # )
+                # attn_weights_reshaped = attn_weights_reshaped.view(bsz, -1)
+
+                # top_indices = torch.topk(
+                #     attn_weights_reshaped, cache_size, dim=-1
+                # ).indices
+
+            elif self.algo == "ideal":
+                pass
+            elif self.algo == "predefined":  # Select important tokens
+                pass
+            else:
+                raise NotImplementedError
+            del attn_weights_reshaped
+            torch.cuda.empty_cache()
+            attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+            ###
+
+            # [x] Softmax top attention weights
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(
+                query_states.dtype
+            )  # (batch_size, q_head_num, 1, seq_len)
+
+            # Handling the case where any values are not selected by threshold
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+            attn_weights = attn_weights * mask
+            ###
+
+            # [x] Update acc_scores
+            self.acc_scores *= self.decay_rate
+            self.acc_scores = torch.cat(
+                (self.acc_scores, torch.zeros_like(self.acc_scores[:, :, :, -1:])),
+                dim=-1,
+            )
+            self.acc_scores += attn_weights * (
+                1 - self.decay_rate
+            )  # (batch_size, q_head_num, 1, seq_len)
+
+            # [x] Update cache_indices
+            self.cache_indices = torch.zeros(
+                (bsz, self.num_key_value_heads * seq_len),
+                dtype=torch.bool,
+                device="cuda",
+            )
+            acc_scores_reshaped = self.acc_scores.view(
+                bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+            )
+            if self.cache_rule == "max":
+                # (batch_size, kv_head_num, 1, seq_len)
+                acc_scores_reshaped = torch.max(acc_scores_reshaped, dim=2).values
+            if self.cache_rule == "mean":
+                acc_scores_reshaped = torch.mean(acc_scores_reshaped, dim=2)
+
+            selected_indices = acc_scores_reshaped > current_cache_threshold
+            acc_scores_reshaped = torch.where(
+                selected_indices,
+                acc_scores_reshaped,
+                torch.zeros_like(acc_scores_reshaped),
+            )
+            acc_scores_reshaped = acc_scores_reshaped.view(bsz, -1)
+
+            top_indices = torch.topk(acc_scores_reshaped, cache_size, dim=-1).indices
+            self.cache_indices.scatter_(dim=-1, index=top_indices, value=True)
+            self.cache_indices = self.cache_indices.view(
+                bsz, self.num_key_value_heads, 1, -1
+            )
+
+        else:  # Prefill phase
+            if self.algo in [
+                "thresholding",
+                "ideal",
+                "predefined",
+            ]:  # Select the top indices in the prefill phase
+                # if self.cache_rule == "max":
+                #     attn_weights_reshaped = attn_weights.clone()
+                #     attn_weights_reshaped = attn_weights_reshaped.view(
+                #         bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                #     )
+                #     # (batch_size, kv_head_num, 1, seq_len)
+                #     attn_weights_reshaped = torch.max(
+                #         attn_weights_reshaped, dim=2
+                #     ).values
+                # if self.cache_rule == "mean":
+                #     attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+                # _, _, _, seq_len = attn_weights_reshaped.shape
+                # cache_size = int(bsz * self.num_key_value_heads * seq_len)
+
+                if self.algo == "thresholding":
+                    # if self.cache_rule in ["max", "mean"]:
+                    #     current_cache_threshold = (
+                    #         torch.max(
+                    #             attn_weights_reshaped, dim=-1, keepdim=True
+                    #         ).values
+                    #         - self.alpha
+                    #     )
+                    # selected_indices = attn_weights_reshaped > current_cache_threshold
+                    # attn_weights_reshaped = torch.where(
+                    #     selected_indices,
+                    #     attn_weights_reshaped,
+                    #     torch.zeros_like(attn_weights_reshaped),
+                    # )
+                    # print(f"attn_weights_reshaped: {attn_weights_reshaped.shape}")
+                    # attn_weights_reshaped = attn_weights_reshaped.view(bsz, -1)
+
+                    # self.cache_indices = torch.topk(
+                    #     attn_weights_reshaped, cache_size, dim=-1
+                    # ).indices
+                    # self.cache_indices = self.cache_indices.view(
+                    #     bsz, self.num_key_value_heads, -1
+                    # )
+                    pass
+
+                elif self.algo == "ideal":
+                    pass
+                elif self.algo == "predefined":
+                    pass
+                else:
+                    raise NotImplementedError
+
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+
+            if self.algo in ["thresholding", "ideal", "predefined"]:
+                _, _, _, seq_len = attn_weights.shape
+                cache_size = int(bsz * self.num_key_value_heads * seq_len)
+                # [x] Create acc_score in Prefill phase
+                decay_weights = torch.pow(
+                    self.decay_rate,
+                    torch.arange(seq_len, dtype=query_states.dtype, device="cuda"),
+                ).flip(dims=[0])
+                decay_weights[1:] *= 1 - self.decay_rate
+                self.acc_scores = (
+                    attn_weights * decay_weights.view(1, 1, seq_len, 1)
+                ).sum(
+                    dim=2, keepdim=True
+                )  # (batch_size, q_head_num, 1, seq_len)
+                acc_scores_reshaped = self.acc_scores.view(
+                    bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                )
+                if self.cache_rule == "max":
+                    acc_scores_reshaped = torch.max(
+                        acc_scores_reshaped, dim=2
+                    ).values  # (batch_size, kv_head_num, 1, seq_len)
+                if self.cache_rule == "mean":
+                    acc_scores_reshaped = torch.mean(acc_scores_reshaped, dim=2)
+                ###
+
+                # [x] Create cache_indices in Prefill phase
+                self.cache_indices = torch.zeros(
+                    (bsz, self.num_key_value_heads * seq_len),
+                    dtype=torch.bool,
+                    device="cuda",
+                )
+                acc_scores_reshaped = acc_scores_reshaped.view(bsz, -1)
+                cached_indices = torch.topk(
+                    acc_scores_reshaped, cache_size, dim=-1
+                ).indices.cuda()  # (batch_size, kv_head_num, 1, topk_num)
+                self.cache_indices.scatter_(
+                    dim=-1, index=cached_indices, value=True
+                )  # (batch_size, kv_head_num, 1, seq_len)
+                self.cache_indices = self.cache_indices.view(
+                    bsz, self.num_key_value_heads, 1, -1
+                )
+                # DEBUG
+                # print(f"acc_scores: {self.acc_scores.shape}")
+                # print(f"cache_indices: {self.cache_indices.shape}")
+                ###
+
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.attention_dropout, training=self.training
         )
+
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -494,6 +760,12 @@ class LlamaAttentionTieredKVCache(nn.Module):
 
         if not output_attentions:
             attn_weights = None
+        # DEBUG
+        # if not is_prefill and self.layer_idx in [0]:
+        #     # if self.count < 2:
+        #     print(f"attn_output: {attn_output}")
+        #     print(f"Shape: {attn_output.shape}")
+        #     # self.count = self.count + 1
 
         return attn_output, attn_weights, past_key_value
 
@@ -756,9 +1028,11 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
-            config=config, layer_idx=layer_idx
-        )
+        # Use the custom self-attention layer
+        # self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
+        #     config=config, layer_idx=layer_idx
+        # )
+        self.self_attn = LlamaAttentionTieredKVCache(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1613,9 +1887,12 @@ class LlamaForCausalLMTieredKVCache(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config, **kwargs):
-        # Setup the cache configuration
-        config.threshold = kwargs["threshold"]
+        # NOTE: Setup the cache configuration
+        config.algo = kwargs["algo"]
+        config.alpha = kwargs["alpha"]
         config.cache_ratio = kwargs["cache_ratio"]
+        config.cache_rule = kwargs["cache_rule"]
+        config.decay_rate = kwargs["decay_rate"]
 
         super().__init__(config)
         self.model = LlamaModelTieredKVCache(config)

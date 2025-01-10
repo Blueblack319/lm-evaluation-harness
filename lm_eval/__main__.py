@@ -403,12 +403,14 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         if cache_args["algo"] in {"ideal"}:
             assert "cache_ratio" in cache_args
         if cache_args["algo"] in {"thresholding"}:
-            assert "threshold" in cache_args
+            assert "alpha" in cache_args
 
-        if "threshold" in cache_args:
-            cache_args["threshold"] = float(cache_args["threshold"])
+        if "alpha" in cache_args:
+            cache_args["alpha"] = float(cache_args["alpha"])
         if "cache_ratio" in cache_args:
             cache_args["cache_ratio"] = float(cache_args["cache_ratio"])
+        if "decay_rate" in cache_args:
+            cache_args["decay_rate"] = float(cache_args["decay_rate"])
 
     for key in cache_args:
         model_args[key] = cache_args[key]

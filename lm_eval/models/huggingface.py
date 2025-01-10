@@ -597,21 +597,17 @@ class HFLM(TemplateLM):
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
 
-            # [ ] Tiered KVCache
+            # [x] Tiered KVCache
             if "algo" in model_kwargs:
-                algo = model_kwargs["algo"]
-                del model_kwargs["algo"]
-                if algo in TIERED_KVCACHE_MODEL_MAPPING:
-                    self._model = LlamaForCausalLMTieredKVCache.from_pretrained(
-                        pretrained,
-                        revision=revision,
-                        torch_dtype=get_dtype(dtype),
-                        trust_remote_code=trust_remote_code,
-                        gguf_file=gguf_file,
-                        **model_kwargs,
-                    )
-                else:
-                    raise NotImplementedError
+                self._model = LlamaForCausalLMTieredKVCache.from_pretrained(
+                    pretrained,
+                    revision=revision,
+                    torch_dtype=get_dtype(dtype),
+                    trust_remote_code=trust_remote_code,
+                    gguf_file=gguf_file,
+                    **model_kwargs,
+                )
+
             else:
                 self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                     pretrained,
