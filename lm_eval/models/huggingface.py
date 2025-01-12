@@ -58,10 +58,10 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from Tiered_KVCache_modeling_llama_old import LlamaForCausalLMTieredKVCache
+from modeling_llama import LlamaForCausalLMTieredKVCache
 
-# from Tiered_KVCache_modeling_llama import LlamaForCausalLMTieredKVCache
-from modeling_llama import LlamaForCausalLM
+# from modeling_llama_old import LlamaForCausalLMTieredKVCache
+from modeling_llama_original import LlamaForCausalLM
 
 
 # TIERED_KVCACHE_MODEL_MAPPING = {
