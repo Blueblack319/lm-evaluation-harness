@@ -38,6 +38,23 @@ from lm_eval.utils import (
     simple_parse_args_string,
 )
 
+# [ ] InfiniteBench
+# from lm_eval.infinitebench_utils.eval_utils import (
+#     DATA_NAME_TO_MAX_NEW_TOKENS,
+#     check_benchmark_availability,
+#     create_prompt,
+#     dump_jsonl,
+#     get_answer,
+#     load_data,
+# )
+# from lm_eval.infinitebench_utils.compute_scores import compute_scores
+# from tqdm import tqdm
+# from vllm import SamplingParams
+# from transformers import GenerationConfig
+# from pathlib import Path
+# import os
+
+###
 
 if TYPE_CHECKING:
     from lm_eval.api.model import LM
@@ -158,7 +175,7 @@ def simple_evaluate(
         torch.manual_seed(torch_random_seed)
 
     # DEBUG
-    # torch.set_printoptions(profile="full")
+    torch.set_printoptions(profile="full")
 
     if fewshot_random_seed is not None:
         seed_message.append(f"Setting fewshot manual seed to {fewshot_random_seed}")
@@ -182,12 +199,14 @@ def simple_evaluate(
         if gen_kwargs == "":
             gen_kwargs = None
 
+    # NOTE: Load Model
     if isinstance(model, str):
         if model_args is None:
             eval_logger.warning("model_args not specified. Using defaults.")
             model_args = ""
 
         if isinstance(model_args, dict):
+            model_args["is_infinitebench"] = False
             eval_logger.info(
                 f"Initializing {model} model, with arguments: {model_args}"
             )
@@ -219,6 +238,7 @@ def simple_evaluate(
             )
         eval_logger.info("Using pre-initialized model")
         lm = model
+    ###
 
     if use_cache is not None:
         eval_logger.info(f"Using cache at {use_cache + '_rank' + str(lm.rank) + '.db'}")
@@ -689,3 +709,350 @@ def request_caching_arg_to_dict(cache_requests: str) -> dict:
     }
 
     return request_caching_args
+
+
+# [ ] InfiniteBench
+# def truncate_input(input: list, max_length: int, manner="middle"):
+#     if max_length < 0:
+#         return input
+#     if len(input) <= max_length:
+#         return input
+#     if manner == "middle":
+#         split = max_length // 2
+#         return input[0:split] + input[-split:]
+#     else:
+#         return None
+
+
+# def truncate_by_tokens(input, tok, max_tokens, manner: str = "middle"):
+#     tokens = tok.encode(input)
+#     len_before = len(tokens)
+#     print(f"# tokens before: {len_before}")
+#     tokens = truncate_input(tokens, max_length=max_tokens, manner=manner)
+#     len_after = len(tokens)  # type: ignore
+#     print(f"# tokens after: {len_after}")
+#     assert len_after <= len_before
+#     assert len_after <= max_tokens or max_tokens < 0
+#     return tokens
+
+
+# def get_pred(
+#     model,
+#     # tok: AutoTokenizer,
+#     tok,
+#     input_text: str,
+#     max_input_length: int,
+#     verbose: bool = False,
+#     generation_config: GenerationConfig = None,
+#     attn_type: str = "vllm",
+# ) -> str:
+#     """
+#     Truncate down to 128k then make inference.
+#     """
+#     input_tokens = truncate_by_tokens(input_text, tok, max_input_length)
+#     if verbose:
+#         print("# tokens:", len(input_tokens))
+#         print("=============== Input ===============")
+#         print(tok.decode(input_tokens[:200]))
+#         print("...")
+#         print(tok.decode(input_tokens[-200:]))
+#         print("=====================================")
+#     if "vllm" in attn_type:
+#         if len(input_tokens) != 1:
+#             input_tokens = [input_tokens]
+#         outputs = model.generate(
+#             prompt_token_ids=input_tokens,
+#             sampling_params=generation_config,
+#         )
+#         output = outputs[0].outputs[0].text
+#         output = output.strip()
+#     else:
+#         input_tensors = {
+#             "input_ids": torch.tensor(input_tokens).unsqueeze(0).to(model.device)
+#         }
+#         # cache = SinkCache(window_length=200000, num_sink_tokens=10000)
+#         # if attn_type == "minference_kv_cache_cpu":
+#         #     input_tensors["use_cache"] = False
+#         outputs = model.generate(**input_tensors, generation_config=generation_config)
+#         # outputs = model.generate(**input_tensors, generation_config=generation_config, past_key_values=cache)
+
+#         output = outputs[0, len(input_tokens) :]
+#         output = tok.decode(output, skip_special_tokens=True)
+#         output = output.strip()
+#     # print(input_text[:5000], input_text[-5000:])
+#     print("Chunked generation:", output)
+#     return output
+
+# @positional_deprecated
+# def infinitebench_evaluate(
+#     model,
+#     model_args: Optional[Union[str, dict]] = None,
+#     tasks: Optional[List[Union[str, dict, object]]] = None,
+#     num_fewshot: Optional[int] = None,
+#     batch_size: Optional[Union[int, str]] = None,
+#     max_batch_size: Optional[int] = None,
+#     device: Optional[str] = None,
+#     use_cache: Optional[str] = None,
+#     cache_requests: bool = False,
+#     rewrite_requests_cache: bool = False,
+#     delete_requests_cache: bool = False,
+#     limit: Optional[Union[int, float]] = None,
+#     bootstrap_iters: int = 100000,
+#     check_integrity: bool = False,
+#     write_out: bool = False,
+#     log_samples: bool = True,
+#     evaluation_tracker: Optional[EvaluationTracker] = None,
+#     system_instruction: Optional[str] = None,
+#     apply_chat_template: Union[bool, str] = False,
+#     fewshot_as_multiturn: bool = False,
+#     gen_kwargs: Optional[str] = None,
+#     task_manager: Optional[TaskManager] = None,
+#     verbosity: str = "INFO",
+#     predict_only: bool = False,
+#     random_seed: int = 0,
+#     numpy_random_seed: int = 1234,
+#     torch_random_seed: int = 1234,
+#     fewshot_random_seed: int = 1234,
+#     data_dir: str = "./data",
+#     max_seq_length: int = 160000,
+#     output_dir: str = "./results",
+#     num_eval_examples: int = -1,
+#     rewrite: bool = True,
+#     start_example_id: int = 0,
+# ):
+#     """Instantiate and evaluate a model on a list of tasks.
+
+#     :param model: Union[str, LM]
+#         Name of model or LM object, see lm_eval.models.get_model
+#     :param model_args: Optional[str, dict]
+#         String or dict arguments for each model class, see LM.create_from_arg_string and LM.create_from_arg_object.
+#         Ignored if `model` argument is a LM object.
+#     :param tasks: list[Union[str, dict, Task]]
+#         List of task names or Task objects. Task objects will be taken to have name task.EVAL_HARNESS_NAME if defined and type(task).__name__ otherwise.
+#     :param num_fewshot: int
+#         Number of examples in few-shot context
+#     :param batch_size: int or str, optional
+#         Batch size for model
+#     :param max_batch_size: int, optional
+#         Maximal batch size to try with automatic batch size detection
+#     :param device: str, optional
+#         PyTorch device (e.g. "cpu" or "cuda:0") for running models
+#     :param use_cache: str, optional
+#         A path to a sqlite db file for caching model responses. `None` if not caching.
+#     :param cache_requests: bool, optional
+#         Speed up evaluation by caching the building of dataset requests. `None` if not caching.
+#     :param rewrite_requests_cache: bool, optional
+#         Rewrites all of the request cache if set to `True`. `None` if not desired.
+#     :param delete_requests_cache: bool, optional
+#         Deletes all of the request cache if set to `True`. `None` if not desired.
+#     :param limit: int or float, optional
+#         Limit the number of examples per task (only use this for testing), If <1, limit is a percentage of the total number of examples.
+#     :param bootstrap_iters:
+#         Number of iterations for bootstrap statistics, used when calculating stderrs. set to 0 for no stderr calculations to be performed.
+#     :param check_integrity: bool
+#         Whether to run the relevant part of the test suite for the tasks
+#     :param write_out: bool
+#         If True, write out an example document and model input for checking task integrity
+#     :param log_samples: bool
+#         If True, write out all model outputs and documents for per-sample measurement and post-hoc analysis
+#     :param system_instruction: str
+#         System instruction to be applied to the prompt
+#     :param apply_chat_template: Union[bool, str]
+#         Specifies whether to apply a chat template to the prompt.
+#         - If set to True, the default chat template is applied.
+#         - If set to a string, applies the specified chat template by name.
+#         Defaults to False (no chat template applied).
+#     :param fewshot_as_multiturn: bool
+#         Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
+#     :param gen_kwargs: str
+#         String arguments for model generation
+#         Ignored for all tasks with loglikelihood output_type
+#     :param predict_only: bool
+#         If true only model outputs will be generated and returned. Metrics will not be evaluated
+#     :param random_seed: int
+#         Random seed for python's random module. If set to None, the seed will not be set.
+#     :param numpy_random_seed: int
+#         Random seed for numpy. If set to None, the seed will not be set.
+#     :param torch_random_seed: int
+#         Random seed for torch. If set to None, the seed will not be set.
+#     :param fewshot_random_seed: int
+#         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
+
+#     :return
+#         Dictionary of results
+#     """
+#     eval_logger.setLevel(getattr(logging, f"{verbosity}"))
+#     start_date = time.time()
+
+#     if delete_requests_cache:
+#         eval_logger.info("Deleting requests cache...")
+#         delete_cache()
+
+#     seed_message = []
+#     if random_seed is not None:
+#         # See https://github.com/EleutherAI/lm-evaluation-harness/pull/1412
+#         seed_message.append(f"Setting random seed to {random_seed}")
+#         random.seed(random_seed)
+
+#     if numpy_random_seed is not None:
+#         seed_message.append(f"Setting numpy seed to {numpy_random_seed}")
+#         np.random.seed(numpy_random_seed)
+
+#     if torch_random_seed is not None:
+#         seed_message.append(f"Setting torch manual seed to {torch_random_seed}")
+#         torch.manual_seed(torch_random_seed)
+
+#     # DEBUG
+#     # torch.set_printoptions(profile="full")
+
+#     if fewshot_random_seed is not None:
+#         seed_message.append(f"Setting fewshot manual seed to {fewshot_random_seed}")
+
+#     if seed_message:
+#         eval_logger.info(" | ".join(seed_message))
+
+#     if tasks is None:
+#         tasks = []
+#     if len(tasks) == 0:
+#         raise ValueError(
+#             "No tasks specified, or no tasks found. Please verify the task names."
+#         )
+
+#     if gen_kwargs is not None:
+#         gen_kwargs = simple_parse_args_string(gen_kwargs)
+#         eval_logger.warning(
+#             "generation_kwargs specified through cli, these settings will update set parameters in yaml tasks. "
+#             "Ensure 'do_sample=True' for non-greedy decoding!"
+#         )
+#         if gen_kwargs == "":
+#             gen_kwargs = None
+
+#     # NOTE: Load tokenizer and model
+#     if isinstance(model, str):
+#         if model_args is None:
+#             eval_logger.warning("model_args not specified. Using defaults.")
+#             model_args = ""
+
+#         if isinstance(model_args, dict):
+#             model_args["is_infinitebench"] = True
+#             eval_logger.info(
+#                 f"Initializing {model} model, with arguments: {model_args}"
+#             )
+#             lm = lm_eval.api.registry.get_model(model).create_from_arg_obj(
+#                 model_args,
+#                 {
+#                     "batch_size": batch_size,
+#                     "max_batch_size": max_batch_size,
+#                     "device": device,
+#                 },
+#             )
+
+#         else:
+#             eval_logger.info(
+#                 f"Initializing {model} model, with arguments: {simple_parse_args_string(model_args)}"
+#             )
+#             lm = lm_eval.api.registry.get_model(model).create_from_arg_string(
+#                 model_args,
+#                 {
+#                     "batch_size": batch_size,
+#                     "max_batch_size": max_batch_size,
+#                     "device": device,
+#                 },
+#             )
+#     else:
+#         if not isinstance(model, lm_eval.api.model.LM):
+#             raise TypeError(
+#                 f"The value of `model` passed to simple_evaluate() was of type {type(model)}, but is required to be a subclass of lm_eval.api.model.LM . This may be because you are passing an initialized Hugging Face PreTrainedModel without having wrapped it in `lm_eval.models.huggingface.HFLM(pretrained=my_model)` first."
+#             )
+#         eval_logger.info("Using pre-initialized model")
+#         lm = model
+#     ###
+#     data_names = [tasks]
+#     verbose = False
+#     attn_type = "hf"
+#     results = {}
+
+#     for data_name in data_names:
+#         max_new_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]
+#         if max_new_tokens >= max_seq_length:
+#             max_new_tokens = 500
+
+#         # if "vllm" in args.attn_type:
+#         #     generation_config = SamplingParams(
+#         #         temperature=0,
+#         #         max_tokens=max_new_tokens,
+#         #     )
+#         # else:
+#         generation_config = GenerationConfig(
+#             max_new_tokens=max_new_tokens,
+#             num_return_sequences=1,
+#             do_sample=False,
+#             # temperature=0,
+#             # top_p=0.95,
+#             pad_token_id=lm.tokenizer.pad_token_id,
+#         )
+
+#         # Data
+#         real_model_name = model_args["pretrained"]
+#         result_dir = Path(output_dir, f"{real_model_name}_{attn_type}")
+#         result_dir.mkdir(exist_ok=True, parents=True)
+#         output_path = result_dir / f"prediction_{data_name}.jsonl"
+#         examples = load_data(data_name, data_dir=data_dir)
+
+#         if num_eval_examples != -1:
+#             num_eval_examples = min(num_eval_examples, len(examples))
+#             examples = examples[:num_eval_examples]
+
+#         preds = []
+#         print("==== Evaluation ====")
+#         print(f"# examples: {len(examples)}")
+#         print(f"Num eval examples: {num_eval_examples}")
+#         print(f"Verbose: {verbose}")
+#         print(f"Max new tokens: {max_new_tokens}")
+
+#         if os.path.exists(output_path) and not rewrite:
+#             print(f"Output file {output_path} exists. Loading from file.")
+#             compute_scores(output_path, data_name, real_model_name, max_seq_length)
+#             with open(output_path) as f:
+#                 preds = [json.loads(ii) for ii in f.readlines()]
+
+#         for i, eg in tqdm(enumerate(examples)):
+#             if i < start_example_id or i < len(preds):
+#                 continue
+#             input_text = create_prompt(eg, data_name, real_model_name, data_dir)
+#             ground_truth = get_answer(eg, data_name)
+#             # print(input_text.index(ground_truth), len(input_text), input_text.index(ground_truth) / len(input_text))
+#             # print(f"====== Example {i} ======")
+
+#             msgs = [dict(role="system", content=input_text)]
+#             input_text = lm.tokenizer.apply_chat_template(
+#                 msgs, add_generation_prompt=True, tokenize=False
+#             )
+#             pred = get_pred(
+#                 lm.model,
+#                 lm.tokenizer,
+#                 input_text,
+#                 max_input_length=max_seq_length - max_new_tokens,
+#                 verbose=verbose,
+#                 generation_config=generation_config,
+#                 attn_type="hf",
+#             )
+#             print("Ground Truth", get_answer(eg, data_name))
+#             if verbose:
+#                 print(pred)
+#             preds.append(
+#                 {
+#                     "id": i,
+#                     "prediction": pred,
+#                     "ground_truth": get_answer(eg, data_name),
+#                 }
+#             )
+#             dump_jsonl(preds, output_path)
+#             torch.cuda.empty_cache()
+
+#         result_file_path = f"{real_model_name}_{attn_type}"
+#         score = compute_scores(output_path, data_name, result_file_path)
+#         results[data_name] = score
+
+#     print("==== Results ====")
+#     print(json.dumps(results, indent=2))

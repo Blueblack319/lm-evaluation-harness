@@ -38,12 +38,30 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
+# [ ] InfiniteBench
+from lm_eval.infinitebench_utils.eval_utils import (
+    DATA_NAME_TO_MAX_NEW_TOKENS,
+    check_benchmark_availability,
+    create_prompt,
+    dump_jsonl,
+    get_answer,
+    load_data,
+)
+from tqdm import tqdm
+from vllm import SamplingParams
+from minference import MInference
+
+###
+
 # [ ] Tiered KVCache
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from Tiered_KVCache_modeling_llama import LlamaForCausalLMTieredKVCache
+from Tiered_KVCache_modeling_llama_old import LlamaForCausalLMTieredKVCache
+
+# from Tiered_KVCache_modeling_llama import LlamaForCausalLMTieredKVCache
+from modeling_llama import LlamaForCausalLM
 
 
 # TIERED_KVCACHE_MODEL_MAPPING = {
@@ -190,6 +208,7 @@ class HFLM(TemplateLM):
             config=self.config, backend=backend, trust_remote_code=trust_remote_code
         )
 
+        # NOTE: Load tokenizer and model
         # load tokenizer so we know tokenizer vocabulary size before loading model and PEFT
         self._create_tokenizer(
             pretrained,
@@ -219,6 +238,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 **kwargs,
             )
+        ###
 
         # access self._model through self.model property outside this method
         if isinstance(self.model, torch.nn.Module):
@@ -598,25 +618,95 @@ class HFLM(TemplateLM):
                         )
 
             # [x] Tiered KVCache
-            if "algo" in model_kwargs:
-                self._model = LlamaForCausalLMTieredKVCache.from_pretrained(
-                    pretrained,
-                    revision=revision,
-                    torch_dtype=get_dtype(dtype),
-                    trust_remote_code=trust_remote_code,
-                    gguf_file=gguf_file,
-                    **model_kwargs,
-                )
+            is_infinitebench = model_kwargs["is_infinitebench"]
+            del model_kwargs["is_infinitebench"]
+            if is_infinitebench:
+                # minference_patch = MInference(
+                #     attn_type,
+                #     pretrained,
+                #     config_path=topk_dims_file_path,
+                #     starting_layer=starting_layer,
+                #     kv_type=kv_type,
+                #     is_search=is_search,
+                #     kv_cache_cpu=kv_cache_cpu,
+                #     kv_cache_cpu_device=kv_cache_cpu_device,
+                # )
 
-            else:
+                # if "vllm" in attn_type:
+                #     llm = LLM(
+                #         model=pretrained,
+                #         max_model_len=max_seq_length,
+                #         enable_chunked_prefill=False,
+                #         tensor_parallel_size=tensor_parallel_size,
+                #         trust_remote_code=trust_remote_code,
+                #         swap_space=64,
+                #     )
+                # else:
+                # config = AutoConfig.from_pretrained(
+                #     pretrained,
+                #     resume_download=None,
+                #     trust_remote_code=trust_remote_code,
+                # )
+                #     if "LWM" in pretrained:
+                #         c = {
+                #             "theta": 10000000,
+                #             "max_sequence_length": 131072,
+                #             "scan_attention": True,
+                #             "scan_query_chunk_size": 1024,
+                #             "scan_key_chunk_size": 1024,
+                #             "scan_mlp": True,
+                #             "scan_mlp_chunk_size": 1024,
+                #             "scan_layers": True,
+                #         }
+                #         config.update(c)
+
                 self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                     pretrained,
-                    revision=revision,
-                    torch_dtype=get_dtype(dtype),
+                    # config=config,
+                    torch_dtype="auto",
+                    device_map="auto",
+                    resume_download=None,
                     trust_remote_code=trust_remote_code,
-                    gguf_file=gguf_file,
-                    **model_kwargs,
                 )
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            # if attn_type not in ["vllm", "hf"]:
+            #     llm = minference_patch(llm)
+
+            # print("Model and tokenizer loaded.")
+
+            else:
+                if model_kwargs["algo"] == "original":
+                    print("Original\n\n")
+                    self._model = LlamaForCausalLM.from_pretrained(
+                        pretrained,
+                        revision=revision,
+                        torch_dtype=get_dtype(dtype),
+                        trust_remote_code=trust_remote_code,
+                        gguf_file=gguf_file,
+                        _attn_implementation="eager",
+                        **model_kwargs,
+                    )
+                elif "algo" in model_kwargs:
+                    self._model = LlamaForCausalLMTieredKVCache.from_pretrained(
+                        pretrained,
+                        revision=revision,
+                        torch_dtype=get_dtype(dtype),
+                        trust_remote_code=trust_remote_code,
+                        gguf_file=gguf_file,
+                        _attn_implementation="eager",
+                        **model_kwargs,
+                    )
+                else:
+                    # _attn_implementation="sdpa"
+                    self._model = self.AUTO_MODEL_CLASS.from_pretrained(
+                        pretrained,
+                        revision=revision,
+                        torch_dtype=get_dtype(dtype),
+                        trust_remote_code=trust_remote_code,
+                        gguf_file=gguf_file,
+                        **model_kwargs,
+                    )
             ######
         else:
             if autogptq and gptqmodel:
@@ -724,6 +814,7 @@ class HFLM(TemplateLM):
         kwargs = {
             "revision": revision,
             "trust_remote_code": trust_remote_code,
+            "resume_download": None,
         }
 
         # gguf format embeds tokenizer and is not compatible with hf tokenizer `use_fast` param
@@ -752,6 +843,7 @@ class HFLM(TemplateLM):
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_name, **kwargs
             )
+
         return None
 
     def _detect_batch_size(self, requests=None, pos: int = 0):

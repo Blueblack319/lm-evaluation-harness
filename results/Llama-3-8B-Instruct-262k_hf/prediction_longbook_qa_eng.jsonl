@@ -1,0 +1,5 @@
+{"id": 0, "prediction": "Gannonmarie is not Mrs. Bronwyn's child.</s>", "ground_truth": ["\"Peyton\""]}
+{"id": 1, "prediction": "Cael is the final to perish.</s>", "ground_truth": ["\"Mrs. Deandra\""]}
+{"id": 2, "prediction": "The name of the Bronwyns' summer home is not mentioned in the text.</s>", "ground_truth": ["the Hebrides"]}
+{"id": 3, "prediction": "Annalisa and Seb accompanied Mr. Bronwyn boating to the lighthouse at last.</s>", "ground_truth": ["\"Annalisa", "Seb", "Adalyn and Adalyn’s boy\""]}
+{"id": 4, "prediction": "Pete takes ten years to complete the painting of Mrs. Bronwyn.</s>", "ground_truth": ["\"about 10 years\"", "\"around ten years"]}

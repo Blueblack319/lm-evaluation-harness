@@ -13,4 +13,6 @@ model_path="Meta-Llama-3.1-8B-Instruct"
 CUDA_VISIBLE_DEVICES=${cuda_devices} python lm_eval/__main__.py --model hf \
 	--model_args pretrained=${model_path},dtype='half' \
 	--cache_args algo=${cache_algo},cache_rule=${cache_rule},alpha=${alpha},cache_ratio=${cache_ratio},decay_rate=${decay_rate} \
-	--tasks ${task} --device cuda --batch_size ${batch_size} --gen_kwargs temperature=0.0 --limit 0.1
+	--tasks ${task} --device cuda --batch_size ${batch_size} --gen_kwargs temperature=0.0 --limit 0.1 --verbosity DEBUG
+
+# bash run.sh 3 gsm8k 1 ideal_2_upper max 7 1.0 0.0

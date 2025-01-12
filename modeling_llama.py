@@ -283,7 +283,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class LlamaAttentionTieredKVCache(nn.Module):
+class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
@@ -306,26 +306,6 @@ class LlamaAttentionTieredKVCache(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
-
-        # NOTE: cache config
-        self.algo = config.algo
-        self.alpha = config.alpha
-        self.cache_ratio = config.cache_ratio
-        self.cache_rule = config.cache_rule
-        self.decay_rate = config.decay_rate
-        self.count = 0
-
-        self.cache_indices = None  # (batch_size, kv_head_num, 1, seq_len)
-        self.acc_scores = None  # (batch_size, q_head_num, 1, seq_len)
-
-        if self.layer_idx == 0:
-            print("Layer " + str(self.layer_idx))
-            print("algo: ", self.algo)
-            print("threshold: ", self.alpha)
-            print("cache_ratio: ", self.cache_ratio)
-            print("cache_rule: ", self.cache_rule)
-            print(" ")
-        ###
 
         self.q_proj = nn.Linear(
             self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
@@ -403,7 +383,10 @@ class LlamaAttentionTieredKVCache(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # [ ] Divide the logic through prefill and decode
+        # DEBUG
+        assert not torch.any(
+            torch.isinf(attn_weights) & (attn_weights == float("-inf"))
+        ), "attn_weights contains -inf values!"
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
@@ -432,9 +415,9 @@ class LlamaAttentionTieredKVCache(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaFlashAttention2(LlamaAttentionTieredKVCache):
+class LlamaFlashAttention2(LlamaAttention):
     """
-    Llama flash attention module. This module inherits from `LlamaAttentionTieredKVCache` as the weights of the module stays
+    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
@@ -566,14 +549,14 @@ class LlamaFlashAttention2(LlamaAttentionTieredKVCache):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaSdpaAttention(LlamaAttentionTieredKVCache):
+class LlamaSdpaAttention(LlamaAttention):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `LlamaAttentionTieredKVCache` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
 
-    # Adapted from LlamaAttentionTieredKVCache.forward
+    # Adapted from LlamaAttention.forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -591,7 +574,7 @@ class LlamaSdpaAttention(LlamaAttentionTieredKVCache):
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
-                "LlamaModelTieredKVCache is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
                 'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
             )
             return super().forward(
@@ -673,7 +656,7 @@ class LlamaSdpaAttention(LlamaAttentionTieredKVCache):
 
 
 LLAMA_ATTENTION_CLASSES = {
-    "eager": LlamaAttentionTieredKVCache,
+    "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
     "sdpa": LlamaSdpaAttention,
 }
@@ -684,10 +667,7 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
-        #     config=config, layer_idx=layer_idx
-        # )
-        self.self_attn = LLAMA_ATTENTION_CLASSES["eager"](
+        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx
         )
 
@@ -894,7 +874,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaModelTieredKVCache(LlamaPreTrainedModel):
+class LlamaModel(LlamaPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -1224,23 +1204,16 @@ class LlamaModelTieredKVCache(LlamaPreTrainedModel):
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
-class LlamaForCausalLMTieredKVCache(LlamaPreTrainedModel, GenerationMixin):
+class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
 
     def __init__(self, config, **kwargs):
-        # NOTE: Setup the cache configuration
-        config.algo = kwargs["algo"]
-        config.alpha = kwargs["alpha"]
-        config.cache_ratio = kwargs["cache_ratio"]
-        config.cache_rule = kwargs["cache_rule"]
-        config.decay_rate = kwargs["decay_rate"]
-
         super().__init__(config)
-        self.model = LlamaModelTieredKVCache(config)
+        self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        ###
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1386,7 +1359,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = LlamaModelTieredKVCache(config)
+        self.model = LlamaModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
@@ -1497,7 +1470,7 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     # Copied from transformers.models.bloom.modeling_bloom.BloomForQuestionAnswering.__init__ with Bloom->Llama
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = LlamaModelTieredKVCache(config)
+        self.transformer = LlamaModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
 
         # Initialize weights and apply final processing
@@ -1586,7 +1559,7 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = LlamaModelTieredKVCache(config)
+        self.model = LlamaModel(config)
         if getattr(config, "classifier_dropout", None) is not None:
             classifier_dropout = config.classifier_dropout
         elif getattr(config, "hidden_dropout", None) is not None:
