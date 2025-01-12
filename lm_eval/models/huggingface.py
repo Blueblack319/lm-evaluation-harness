@@ -39,17 +39,17 @@ from lm_eval.models.utils import (
 )
 
 # [ ] InfiniteBench
-from lm_eval.infinitebench_utils.eval_utils import (
-    DATA_NAME_TO_MAX_NEW_TOKENS,
-    check_benchmark_availability,
-    create_prompt,
-    dump_jsonl,
-    get_answer,
-    load_data,
-)
-from tqdm import tqdm
-from vllm import SamplingParams
-from minference import MInference
+# from lm_eval.infinitebench_utils.eval_utils import (
+#     DATA_NAME_TO_MAX_NEW_TOKENS,
+#     check_benchmark_availability,
+#     create_prompt,
+#     dump_jsonl,
+#     get_answer,
+#     load_data,
+# )
+# from tqdm import tqdm
+# from vllm import SamplingParams
+# from minference import MInference
 
 ###
 

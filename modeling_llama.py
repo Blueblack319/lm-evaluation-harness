@@ -340,6 +340,7 @@ class LlamaAttentionTieredKVCache(nn.Module):
         self.cache_ratio = config.cache_ratio
         self.cache_rule = config.cache_rule
         self.decay_rate = config.decay_rate
+        self.eff_threshold = config.eff_threshold
         self.count = 0
 
         self.cached_token_indices = None  # (batch_size, kv_head_num, 1, seq_len)
@@ -351,6 +352,7 @@ class LlamaAttentionTieredKVCache(nn.Module):
             print("threshold: ", self.alpha)
             print("cache_ratio: ", self.cache_ratio)
             print("cache_rule: ", self.cache_rule)
+            print("eff_threshold: ", self.eff_threshold)
             print(" ")
         ###
 
@@ -478,7 +480,9 @@ class LlamaAttentionTieredKVCache(nn.Module):
                 "thresholding",
                 "ideal",
                 "predefined",
+                "effective_upper",
             ]:
+                _, _, _, seq_len = attn_weights.shape
                 attn_weights_reshaped = attn_weights.clone()
                 attn_weights_reshaped = attn_weights_reshaped.view(
                     bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
@@ -491,7 +495,7 @@ class LlamaAttentionTieredKVCache(nn.Module):
                     ).values
                 if self.cache_rule == "mean":
                     attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
-                _, _, _, seq_len = attn_weights_reshaped.shape
+
                 cache_size = int(self.cache_ratio * self.num_key_value_heads * seq_len)
                 mask = torch.zeros(
                     (bsz, self.num_key_value_heads * seq_len), dtype=torch.bool
@@ -501,6 +505,20 @@ class LlamaAttentionTieredKVCache(nn.Module):
                 if (
                     self.algo == "thresholding_upper"
                 ):  # Select important tokens via threshold
+                    # GQA-aware
+                    # attn_weights_reshaped = attn_weights.clone()
+                    # attn_weights_reshaped = attn_weights_reshaped.view(
+                    #     bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                    # )
+                    # if self.cache_rule == "max":
+                    #     # (batch_size, kv_head_num, 1, seq_len)
+                    #     attn_weights_reshaped = torch.max(
+                    #         attn_weights_reshaped, dim=2
+                    #     ).values
+                    # if self.cache_rule == "mean":
+                    #     attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+                    ###
+
                     # Determine GQA-aware current_cache_threshold
                     if self.cache_rule in ["max", "mean"]:
                         current_cache_threshold = (
@@ -525,6 +543,21 @@ class LlamaAttentionTieredKVCache(nn.Module):
                     mask = repeat_kv(mask, self.num_key_value_groups)
                     ###
                 elif self.algo == "ideal_1_upper":  # Select topk per head
+                    # GQA-aware
+                    # attn_weights_reshaped = attn_weights.clone()
+                    # attn_weights_reshaped = attn_weights_reshaped.view(
+                    #     bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                    # )
+
+                    # if self.cache_rule == "max":
+                    #     # (batch_size, kv_head_num, 1, seq_len)
+                    #     attn_weights_reshaped = torch.max(
+                    #         attn_weights_reshaped, dim=2
+                    #     ).values
+                    # if self.cache_rule == "mean":
+                    #     attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+                    ###
+
                     _, topk_indices = torch.topk(
                         attn_weights_reshaped, int(seq_len * self.cache_ratio), dim=-1
                     )
@@ -535,10 +568,20 @@ class LlamaAttentionTieredKVCache(nn.Module):
 
                 elif self.algo == "ideal_2_upper":  # Select topk from all heads
                     attn_weights_reshaped = nn.functional.softmax(
-                        attn_weights_reshaped, dim=-1, dtype=torch.float32
+                        attn_weights, dim=-1, dtype=torch.float32
                     ).to(
                         query_states.dtype
                     )  # (batch_size, q_head_num, 1, seq_len)
+                    attn_weights_reshaped = attn_weights_reshaped.view(
+                        bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                    )
+                    if self.cache_rule == "max":
+                        attn_weights_reshaped = torch.max(
+                            attn_weights_reshaped, dim=2
+                        ).values  # (batch_size, kv_head_num, 1, seq_len)
+                    if self.cache_rule == "mean":
+                        attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+
                     attn_weights_reshaped = attn_weights_reshaped.view(bsz, -1)
                     _, total_size = attn_weights_reshaped.shape
                     assert (
@@ -563,6 +606,20 @@ class LlamaAttentionTieredKVCache(nn.Module):
                     mask = repeat_kv(mask, self.num_key_value_groups)
 
                     # [x] Compute current_cache_threshold
+                    # GQA-aware
+                    # attn_weights_reshaped = attn_weights.clone()
+                    # attn_weights_reshaped = attn_weights_reshaped.view(
+                    #     bsz, self.num_key_value_heads, self.num_key_value_groups, 1, -1
+                    # )
+
+                    # if self.cache_rule == "max":
+                    #     # (batch_size, kv_head_num, 1, seq_len)
+                    #     attn_weights_reshaped = torch.max(
+                    #         attn_weights_reshaped, dim=2
+                    #     ).values
+                    # if self.cache_rule == "mean":
+                    #     attn_weights_reshaped = torch.mean(attn_weights_reshaped, dim=2)
+
                     # Determine GQA-aware current_cache_threshold
                     if self.cache_rule == "max":
                         current_cache_threshold = (
@@ -588,6 +645,50 @@ class LlamaAttentionTieredKVCache(nn.Module):
                     self.cached_token_indices = (
                         attn_weights_reshaped > current_cache_threshold
                     )  # (batch_num, kv_head_num, 1, seq_len)
+                elif self.algo == "effective_upper":
+                    # [x] Identify effective indices
+                    attn_weights_reshaped = nn.functional.softmax(
+                        attn_weights, dim=-1, dtype=torch.float32
+                    ).to(
+                        query_states.dtype
+                    )  # (batch_size, q_head_num, 1, seq_len)
+                    _, q_head_num, _, _ = attn_weights_reshaped.shape
+                    effective_indices = [[] for _ in range(bsz)]
+                    for b_idx in range(bsz):
+                        top_indices = torch.tensor([], device="cuda")
+                        for h_idx in range(q_head_num):
+                            attn_sorted, attn_sorted_indices = torch.sort(
+                                attn_weights_reshaped[b_idx, h_idx, 0, :],
+                                dim=-1,
+                                descending=True,
+                            )
+                            cum_sum = torch.cumsum(attn_sorted, dim=0)
+                            kv_size = (
+                                torch.where(cum_sum > self.eff_threshold)[0][0].item()
+                                + 1
+                            )
+                            top_indices = torch.cat(
+                                (top_indices, attn_sorted_indices[:kv_size])
+                            )
+                            if h_idx % 4 == 3:
+                                unique_indices = torch.unique(top_indices).to(
+                                    dtype=torch.long
+                                )
+                                # print(f"unique_indices: {unique_indices}")
+                                effective_indices[b_idx].append(unique_indices)
+                                top_indices = torch.tensor([], device="cuda")
+                        assert len(effective_indices[b_idx]) == self.num_key_value_heads
+
+                    # [x] Create mask
+                    mask = mask.view(bsz, self.num_key_value_heads, 1, -1)
+                    for b_idx in range(bsz):
+                        for kv_h_idx in range(self.num_key_value_heads):
+                            mask[b_idx][kv_h_idx][0].scatter_(
+                                dim=-1,
+                                index=effective_indices[b_idx][kv_h_idx],
+                                value=True,
+                            )
+                    mask = repeat_kv(mask, self.num_key_value_groups)
                 elif self.algo == "ideal":
                     pass
                 elif self.algo == "predefined":  # Select important tokens
@@ -597,6 +698,9 @@ class LlamaAttentionTieredKVCache(nn.Module):
 
                 del attn_weights_reshaped
                 torch.cuda.empty_cache()
+                assert attn_weights.size(dim=-1) == mask.size(
+                    dim=-1
+                ), "Error: Shape of mask doesn't match"
                 attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
             ##########################
 
@@ -657,6 +761,10 @@ class LlamaAttentionTieredKVCache(nn.Module):
                 self.cached_token_indices = self.cached_token_indices.view(
                     bsz, -1
                 )  # (batch_num, kv_head_num * seq_len)
+                # DEBUG
+                # print(
+                #     f"Layer: {self.layer_idx}, # indices: {torch.sum(self.cached_token_indices[0])}, # valid indices: {(acc_weights_reshaped[0] != 0).sum()}, Cache size: {int(self.cache_ratio * self.num_key_value_heads * seq_len)}"
+                # )
 
                 acc_weights_reshaped = torch.where(
                     self.cached_token_indices,
@@ -1896,6 +2004,7 @@ class LlamaForCausalLMTieredKVCache(LlamaPreTrainedModel, GenerationMixin):
         config.cache_ratio = kwargs["cache_ratio"]
         config.cache_rule = kwargs["cache_rule"]
         config.decay_rate = kwargs["decay_rate"]
+        config.eff_threshold = kwargs["eff_threshold"]
 
         super().__init__(config)
         self.model = LlamaModelTieredKVCache(config)
