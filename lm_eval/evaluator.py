@@ -534,6 +534,10 @@ def evaluate(
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
 
+        # DEBUG
+        for layer in lm.model.model.layers:
+            print(layer.self_attn.algo)
+
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
     ### Postprocess outputs ###

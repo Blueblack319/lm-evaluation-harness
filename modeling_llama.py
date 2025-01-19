@@ -833,6 +833,21 @@ class LlamaAttentionTieredKVCache(nn.Module):
                 ###
 
         else:  # Prefill phase
+            # NOTE: Starlink
+            ### Identify the important indices in the context blocks ###
+            # [ ] starlink_upper_1: using Softmax(QK^T) and cache_ratio
+            attn_weights_tmp = attn_weights.clone()
+            attn_weights_tmp = nn.functional.softmax(
+                attn_weights_tmp, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+
+            # [ ] starlink_upper_2: using Softmax(QK^T) and cumsum
+            # [ ] starlink_upper_3: using QK^T with thresholding
+            # [ ] starlink_upper_4: using identify important indices via light-matmul
+            ######
+            # [ ] Masking context blocks except for the short anchor and important indices
+
+            ###
             # upcast attention to fp32
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
