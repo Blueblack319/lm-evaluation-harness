@@ -59,6 +59,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from modeling_llama import LlamaForCausalLMTieredKVCache
+from modeling_llama_starlink import LlamaForCausalLMStarlink
 
 # from modeling_llama_old import LlamaForCausalLMTieredKVCache
 from modeling_llama_original import LlamaForCausalLM
@@ -688,7 +689,7 @@ class HFLM(TemplateLM):
                         **model_kwargs,
                     )
                 elif "algo" in model_kwargs:
-                    self._model = LlamaForCausalLMTieredKVCache.from_pretrained(
+                    self._model = LlamaForCausalLMStarlink.from_pretrained(
                         pretrained,
                         revision=revision,
                         torch_dtype=get_dtype(dtype),

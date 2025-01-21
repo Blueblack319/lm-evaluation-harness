@@ -175,7 +175,7 @@ def simple_evaluate(
         torch.manual_seed(torch_random_seed)
 
     # DEBUG
-    torch.set_printoptions(profile="full")
+    # torch.set_printoptions(profile="full")
 
     if fewshot_random_seed is not None:
         seed_message.append(f"Setting fewshot manual seed to {fewshot_random_seed}")
@@ -905,9 +905,6 @@ def request_caching_arg_to_dict(cache_requests: str) -> dict:
 #     if torch_random_seed is not None:
 #         seed_message.append(f"Setting torch manual seed to {torch_random_seed}")
 #         torch.manual_seed(torch_random_seed)
-
-#     # DEBUG
-#     # torch.set_printoptions(profile="full")
 
 #     if fewshot_random_seed is not None:
 #         seed_message.append(f"Setting fewshot manual seed to {fewshot_random_seed}")

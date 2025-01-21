@@ -160,6 +160,16 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         if "eff_threshold" in cache_args:
             cache_args["eff_threshold"] = float(cache_args["eff_threshold"])
 
+        # NOTE. Starlink
+        assert "algo" in cache_args
+        assert "prefill_algo" in cache_args
+        assert "block_num" in cache_args
+        assert "anchor_num" in cache_args
+        assert "prefill_ratio" in cache_args
+        cache_args["prefill_ratio"] = float(cache_args["prefill_ratio"])
+        cache_args["block_num"] = int(cache_args["block_num"])
+        cache_args["anchor_num"] = int(cache_args["anchor_num"])
+
         for key in cache_args:
             model_args[key] = cache_args[key]
     ###

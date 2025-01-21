@@ -308,9 +308,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-####################
-# [ ] Tiered KVCache
-class LlamaAttentionTieredKVCache(nn.Module):
+class LlamaAttentionStarlink(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
@@ -343,6 +341,12 @@ class LlamaAttentionTieredKVCache(nn.Module):
         self.eff_threshold = config.eff_threshold
         self.count = 0
 
+        # NOTE. Starlink
+        self.prefill_algo = config.prefill_algo
+        self.prefill_ratio = config.prefill_ratio
+        self.block_num = config.block_num
+        self.anchor_num = config.anchor_num
+
         self.cached_token_indices = None  # (batch_size, kv_head_num, 1, seq_len)
         self.acc_weights = None  # (batch_size, q_head_num, 1, seq_len)
 
@@ -353,6 +357,10 @@ class LlamaAttentionTieredKVCache(nn.Module):
             print("cache_ratio: ", self.cache_ratio)
             print("cache_rule: ", self.cache_rule)
             print("eff_threshold: ", self.eff_threshold)
+            print("prefill_algo: ", self.prefill_algo)
+            print("prefill_ratio: ", self.prefill_ratio)
+            print("block_num: ", self.block_num)
+            print("anchor_num: ", self.anchor_num)
             print(" ")
         ###
 
@@ -836,17 +844,284 @@ class LlamaAttentionTieredKVCache(nn.Module):
         else:  # Prefill phase
             # NOTE: Starlink
             ### Identify the important indices in the context blocks ###
-            # [ ] starlink_upper_1: using Softmax(QK^T) and cache_ratio
             attn_weights_tmp = attn_weights.clone()
-            attn_weights_tmp = nn.functional.softmax(
-                attn_weights_tmp, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
+            block_size = attn_weights_tmp.size(dim=-1) // self.block_num
 
+            # [x] Fill the all indices with -inf value
+            neg_inf = -6.5504e04
+            attn_weights.fill_(neg_inf)
+
+            # [x] Fill the full attention indices
+            for i in range(self.block_num - 1):
+                attn_weights[
+                    :,
+                    :,
+                    block_size * i : block_size * (i + 1),
+                    block_size * i :,
+                ] = attn_weights_tmp[
+                    :,
+                    :,
+                    block_size * i : block_size * (i + 1),
+                    block_size * i :,
+                ].clone()
+            attn_weights[
+                :,
+                :,
+                block_size * (self.block_num - 1) :,
+                block_size * (self.block_num - 1) :,
+            ] = attn_weights_tmp[
+                :,
+                :,
+                block_size * (self.block_num - 1) :,
+                block_size * (self.block_num - 1) :,
+            ].clone()
+
+            # [x] Fill the anchor indices
+            attn_weights[:, :, :, : self.anchor_num] = attn_weights_tmp[
+                :, :, :, : self.anchor_num
+            ].clone()
+
+            # DEBUG
+            # print(f"attn_weights: {attn_weights}")
+
+            # [ ] Full Attention
+            if self.prefill_algo == "full":
+                # [x] Fill the important indices of the sparse attention
+                for i in range(1, self.block_num - 1):
+                    curr_attn_weights_block = attn_weights_tmp[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                        # : block_size * i,
+                    ].clone()  # (B, H_q, block_size, block_size * i - anchor_num)
+                    # curr_attn_weights_block[:, :, :, : self.anchor_num] = float("-inf")
+
+                    assert (
+                        curr_attn_weights_block.size(dim=-1)
+                        == block_size * i - self.anchor_num
+                    ), "Shape Error"
+
+                    # Identify the top-k indices
+                    curr_indices = torch.topk(
+                        curr_attn_weights_block,
+                        block_size * i - self.anchor_num,
+                    ).indices  # (B, H_q, block_size, block_size * i - anchor_num)
+                    # (B, H_q, block_size, cache_size)
+
+                    assert (
+                        curr_indices.shape == curr_attn_weights_block.shape
+                    ), "Shape Error"
+
+                    # Gather the value for the indices
+                    curr_important_values = torch.gather(
+                        curr_attn_weights_block, dim=3, index=curr_indices
+                    )  # (B, H_q, block_size, block_size * i - anchor_num)
+                    # (B, H_q, block_size, cache_size)
+
+                    # Fill the value for the indices
+                    attn_weights[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                        # : block_size * i,
+                    ] = attn_weights[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                        # : block_size * i,
+                    ].scatter_(
+                        dim=3, index=curr_indices, src=curr_important_values
+                    )
+
+                    assert torch.equal(
+                        curr_attn_weights_block[:, :, :, :],
+                        attn_weights[
+                            :,
+                            :,
+                            block_size * i : block_size * (i + 1),
+                            self.anchor_num : block_size * i,
+                            # : block_size * i,
+                        ],
+                    ), "Scatter Error"
+                ###
+
+                # [x] Handle the last one
+                curr_attn_weights_block = attn_weights_tmp[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                    # : block_size * (self.block_num - 1),
+                ].clone()  # (B, H_q, block_size-a, block_size * (block_num-1) - anchor_num)
+                # (B, H_q, block_size-a, block_size * (block_num-1) - anchor_num)
+                assert (
+                    curr_attn_weights_block.size(dim=-1)
+                    == block_size * (self.block_num - 1) - self.anchor_num
+                ), "Shape Error"
+                # Identify the top-k indices
+                curr_indices = torch.topk(
+                    curr_attn_weights_block,
+                    # int(
+                    #     self.cache_ratio
+                    #     * (block_size * (self.block_num - 1) - self.anchor_num)
+                    # ),
+                    block_size * (self.block_num - 1) - self.anchor_num,
+                    # block_size * (self.block_num - 1),
+                ).indices  # (B, H_q, block_size-a, cache_size)
+                # (B, H_q, block_size-a, block_size * (block_num-1) - anchor_num)
+                # Gather the value for the indices
+                curr_important_values = torch.gather(
+                    curr_attn_weights_block, dim=3, index=curr_indices
+                )  # (B, H_q, block_size-a, block_size * (block_num-1) - anchor_num)
+                # Fill the value for the indices
+                attn_weights[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                    # : block_size * (self.block_num - 1),
+                ] = attn_weights[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                    # : block_size * (self.block_num - 1),
+                ].scatter_(
+                    dim=3, index=curr_indices, src=curr_important_values
+                )
+
+                assert torch.equal(
+                    curr_attn_weights_block,
+                    attn_weights[
+                        :,
+                        :,
+                        block_size * (self.block_num - 1) :,
+                        self.anchor_num : block_size * (self.block_num - 1),
+                        # : block_size * (self.block_num - 1),
+                    ],
+                ), "Scatter Error"
+                ###
+
+                # DEBUG
+                for s_idx in range(attn_weights.size(dim=-1)):
+                    if not torch.equal(
+                        attn_weights[:, :, s_idx, :], attn_weights_tmp[:, :, s_idx, :]
+                    ):
+                        for ss in range(attn_weights.size(dim=-1)):
+                            assert torch.equal(
+                                attn_weights[:, :, s_idx, ss],
+                                attn_weights_tmp[:, :, s_idx, ss],
+                            ), f"s_idx: {s_idx}, ss: {ss}\nattn_weights: {attn_weights[:, :, s_idx, ss]}\nattn_weights_tmp: {attn_weights_tmp[:, :, s_idx, ss]}"
+
+                assert torch.equal(
+                    attn_weights, attn_weights_tmp
+                ), "Error, attn_weights and attn_weights_tmp are different"
+
+            # [x] starlink_upper_1: using Softmax(QK^T) and cache_ratio
+            if self.prefill_algo == "starlink_upper_1":
+                # [x] Fill the important indices of the sparse attention
+                for i in range(1, self.block_num - 1):
+                    curr_attn_weights_block = attn_weights_tmp[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                        # : block_size * i,
+                    ].clone()  # (B, H_q, block_size, block_size * i - anchor_num)
+
+                    assert (
+                        curr_attn_weights_block.size(dim=-1)
+                        == block_size * i - self.anchor_num
+                    ), "Shape Error"
+
+                    # Identify the top-k indices
+                    curr_indices = torch.topk(
+                        curr_attn_weights_block,
+                        int(self.prefill_ratio * curr_attn_weights_block.size(dim=-1)),
+                    ).indices  # (B, H_q, block_size, cache_size)
+
+                    # Gather the value for the indices
+                    curr_important_values = torch.gather(
+                        curr_attn_weights_block, dim=3, index=curr_indices
+                    )  # (B, H_q, block_size, cache_size)
+
+                    assert (
+                        curr_indices.shape == curr_important_values.shape
+                    ), "Shape Error"
+
+                    # Fill the value for the indices
+                    attn_weights[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                    ] = attn_weights[
+                        :,
+                        :,
+                        block_size * i : block_size * (i + 1),
+                        self.anchor_num : block_size * i,
+                    ].scatter_(
+                        dim=3, index=curr_indices, src=curr_important_values
+                    )
+                ###
+
+                # [x] Handle the last one
+                curr_attn_weights_block = attn_weights_tmp[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                ].clone()  # (B, H_q, block_size-a, block_size * (block_num-1) - anchor_num)
+                assert (
+                    curr_attn_weights_block.size(dim=-1)
+                    == block_size * (self.block_num - 1) - self.anchor_num
+                ), "Shape Error"
+                # Identify the top-k indices
+                curr_indices = torch.topk(
+                    curr_attn_weights_block,
+                    int(self.prefill_ratio * curr_attn_weights_block.size(dim=-1)),
+                ).indices  # (B, H_q, block_size-a, cache_size)
+                # Gather the value for the indices
+                curr_important_values = torch.gather(
+                    curr_attn_weights_block, dim=3, index=curr_indices
+                )  # (B, H_q, block_size-a, cache_size)
+                # Fill the value for the indices
+                attn_weights[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                ] = attn_weights[
+                    :,
+                    :,
+                    block_size * (self.block_num - 1) :,
+                    self.anchor_num : block_size * (self.block_num - 1),
+                ].scatter_(
+                    dim=3, index=curr_indices, src=curr_important_values
+                )
+                # DEBUG
+                # for s_idx in range(0, attn_weights.size(dim=-1), block_size):
+                #     eff_indices = attn_weights[0, :, s_idx, :] > neg_inf
+                #     eff_indices_num = torch.sum(eff_indices, dim=-1)
+                # print(f"eff_indices_num: {eff_indices_num}")
+                # print(
+                #     f"Num: {eff_indices_num[14]} / eff_indices: {eff_indices[14,:]}"
+                # )
+                # for i in range(
+                #     self.num_key_value_groups * self.num_key_value_heads
+                # ):
+                #     print(
+                #         f"seq_len: {s_idx} / eff_indices_num: {eff_indices_num[i]}"
+                #     )
+                ###
+            ###
             # [ ] starlink_upper_2: using Softmax(QK^T) and cumsum
             # [ ] starlink_upper_3: using QK^T with thresholding
             # [ ] starlink_upper_4: using identify important indices via light-matmul
             ######
-            # [ ] Masking context blocks except for the short anchor and important indices
 
             ###
             # upcast attention to fp32
@@ -948,9 +1223,9 @@ class LlamaAttentionTieredKVCache(nn.Module):
 ####################
 
 
-class LlamaFlashAttention2(LlamaAttentionTieredKVCache):
+class LlamaFlashAttention2(LlamaAttentionStarlink):
     """
-    Llama flash attention module. This module inherits from `LlamaAttentionTieredKVCache` as the weights of the module stays
+    Llama flash attention module. This module inherits from `LlamaAttentionStarlink` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
@@ -1080,14 +1355,14 @@ class LlamaFlashAttention2(LlamaAttentionTieredKVCache):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaSdpaAttention(LlamaAttentionTieredKVCache):
+class LlamaSdpaAttention(LlamaAttentionStarlink):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `LlamaAttentionTieredKVCache` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    `LlamaAttentionStarlink` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
 
-    # Adapted from LlamaAttentionTieredKVCache.forward
+    # Adapted from LlamaAttentionStarlink.forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1192,7 +1467,7 @@ class LlamaSdpaAttention(LlamaAttentionTieredKVCache):
 
 
 LLAMA_ATTENTION_CLASSES = {
-    "eager": LlamaAttentionTieredKVCache,
+    "eager": LlamaAttentionStarlink,
     # "flash_attention_2": LlamaFlashAttention2,
     # "sdpa": LlamaSdpaAttention,
 }
@@ -1207,7 +1482,7 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
             config=config, layer_idx=layer_idx
         )
-        # self.self_attn = LlamaAttentionTieredKVCache(config=config, layer_idx=layer_idx)
+        # self.self_attn = LlamaAttentionStarlink(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1732,13 +2007,11 @@ class LlamaModel(LlamaPreTrainedModel):
         return causal_mask
 
 
-##########################################
-# [ ] Tiered KVCache
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaModelTieredKVCache(LlamaPreTrainedModel):
+class LlamaModelStarlink(LlamaPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -2058,7 +2331,7 @@ class LlamaModelTieredKVCache(LlamaPreTrainedModel):
         return causal_mask
 
 
-class LlamaForCausalLMTieredKVCache(LlamaPreTrainedModel, GenerationMixin):
+class LlamaForCausalLMStarlink(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config, **kwargs):
@@ -2070,8 +2343,14 @@ class LlamaForCausalLMTieredKVCache(LlamaPreTrainedModel, GenerationMixin):
         config.decay_rate = kwargs["decay_rate"]
         config.eff_threshold = kwargs["eff_threshold"]
 
+        # NOTE. Starlink
+        config.prefill_algo = kwargs["prefill_algo"]
+        config.prefill_ratio = kwargs["prefill_ratio"]
+        config.block_num = kwargs["block_num"]
+        config.anchor_num = kwargs["anchor_num"]
+
         super().__init__(config)
-        self.model = LlamaModelTieredKVCache(config)
+        self.model = LlamaModelStarlink(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         ###
